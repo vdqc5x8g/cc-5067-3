@@ -142,7 +142,7 @@ class PanelModel:
         eng = self.engine
         fmin, fmax = 20.0, eng.fs * 0.5
         grid = [fmin * (fmax / fmin) ** (i / (points - 1)) for i in range(points)]
-        xo = eng._core.crossover
+        xo = eng.crossover   # active (audible) topology, incl. a pending move
         band_db = []
         for k in range(eng.num_bands):
             band_db.append([20.0 * math.log10(abs(xo.H_band(k, math.tau * f / eng.fs)) + 1e-15)
@@ -150,6 +150,15 @@ class PanelModel:
         sum_db = [20.0 * math.log10(abs(xo.H_sum(math.tau * f / eng.fs)) + 1e-15)
                   for f in grid]
         return grid, band_db, sum_db
+
+    def response_anomaly(self, grid, sum_db, tol_db=0.05):
+        """Report a non-flat declared sum curve (sum_db is already in dB)."""
+        worst = max((abs(v) for v in sum_db), default=0.0)
+        if worst <= tol_db:
+            return None
+        i = max(range(len(sum_db)), key=lambda j: abs(sum_db[j]))
+        f = grid[i] if grid else 0.0
+        return (f"分带响应异常: 合成曲线偏离 0 dB 达 {worst:.3f} dB @ {f:.0f} Hz")
 
     def audition(self, material):
         if material not in MATERIALS:
@@ -183,6 +192,9 @@ class PanelModel:
                     c.solo, c.mute = s, m
             ref = eng.reference_allpass().process(x)
             recomb = max(abs(a - b) for a, b in zip(u, ref)) if x else 0.0
+            anomaly = None
+            if recomb > 1e-6:
+                anomaly = f"合成试听异常: 重组误差 {recomb:.3e} 超过 1e-6"
             self.last_input = x
             self.last_output = y
             self.last_results = {
@@ -194,16 +206,18 @@ class PanelModel:
                 "max_gr_db": max_gr,
                 "switch_log": list(eng.switch_log[-8:]),
                 "latency_samples": eng.latency_samples,
+                "anomaly": anomaly,
             }
             return self.last_results
 
     def state_dict(self):
         eng = self.engine
         grid, band_db, sum_db = self.response_curves()
+        dyn_state = eng.envelope_state()
         return {
             "fs": eng.fs,
             "freqs": list(eng.freqs),
-            "pending_freqs": eng._pending_freqs,
+            "pending_freqs": eng.pending_freqs,
             "bypass": eng.bypass,
             "processing_on": eng.processing_on,
             "latency_samples": eng.latency_samples,
@@ -216,11 +230,13 @@ class PanelModel:
                 "max_bands": eng.MAX_BANDS,
             },
             "bands": [dict(c.__dict__) for c in eng.bands],
+            "dynamics": dyn_state,
             "ranges": eng.band_ranges(),
             "colors": BAND_COLORS[:eng.num_bands],
             "grid": grid,
             "band_db": band_db,
             "sum_db": sum_db,
+            "response_anomaly": self.response_anomaly(grid, sum_db),
             "switch_log": list(eng.switch_log[-8:]),
             "has_audio": bool(self.last_output),
             "results": self.last_results,
@@ -244,6 +260,10 @@ PAGE = """<!doctype html>
  button:disabled{opacity:.4}
  .sw{width:12px;height:12px;border-radius:3px;display:inline-block}
  #status{color:#ff8080;min-height:18px;margin:6px 0}
+ #dyn{background:#0c0e12;border:1px solid #333;border-radius:6px;padding:8px;margin:6px 0;font-family:ui-monospace,monospace;font-size:12px}
+ #dyn .d{display:flex;justify-content:space-between;gap:8px}
+ #dyn .warn{color:#ffb84d}
+ #anom{color:#ffb84d;min-height:16px;font-size:12px;margin:2px 0}
  #results{background:#0c0e12;border:1px solid #333;border-radius:6px;padding:8px;white-space:pre-wrap;font-family:ui-monospace,monospace;font-size:12px;max-height:220px;overflow:auto}
  audio{width:260px;height:32px}
  label{color:#9ab}
@@ -255,6 +275,8 @@ PAGE = """<!doctype html>
   <div class="row"><label>全局:</label>
    <button id="bypass">旁路</button><button id="proc">处理开</button></div>
   <div id="bands"></div>
+  <div id="anom"></div>
+  <div id="dyn"></div>
   <div class="row"><label>素材:</label><select id="mat"></select>
    <button id="run">运行试听</button></div>
   <div class="row"><label>输入:</label><audio id="ain" controls></audio></div>
@@ -311,7 +333,20 @@ function controls(){
   bd.appendChild(r);});
  const ms=document.getElementById('mat');if(!ms.options.length)
   S.materials.forEach(m=>{const o=document.createElement('option');o.value=o.textContent=m;ms.add(o);});
+ drawDyn();
+ const an=document.getElementById('anom');
+ const msgs=[];if(S.response_anomaly)msgs.push(S.response_anomaly);
+ if(S.results&&S.results.anomaly)msgs.push(S.results.anomaly);
+ an.textContent=msgs.join('  |  ');
  if(S.results)showResults(S.results);}
+function drawDyn(){const el=document.getElementById('dyn');
+ const rows=(S.dynamics||[]).map(d=>{
+  const lo=d.range[0],hi=d.range[1];
+  const lab=(lo<1000?lo.toFixed(0):lo/1000+'k')+'–'+(hi>=1000?hi/1000+'k':hi.toFixed(0))+' Hz';
+  const env=(20*Math.log10(d.envelope+1e-12)).toFixed(1);
+  return '<div class="d"><span>band'+d.index+' '+lab+'</span><span>包络 '+env+' dBFS · 增益 '+d.gain_db.toFixed(1)+' dB</span></div>';});
+ el.innerHTML='<div class="d"><b>分带动态运行状态</b><span>'+
+  (S.processing_on?'处理开':'处理关')+(S.bypass?' · 旁路':'')+'</span></div>'+rows.join('');}
 function showResults(R){document.getElementById('results').textContent=
  '素材 '+R.material+'  样本 '+R.samples+'  延迟 '+R.latency_samples+' 样本\\n'+
  '峰值 in '+R.peak_in.toFixed(3)+' / out '+R.peak_out.toFixed(3)+'\\n'+

@@ -1,9 +1,15 @@
 """Per-band dynamics: peak envelope detector + soft-knee gain computer.
 
-State (the envelope) persists across audio blocks; the same detector
-coefficients are used for the gain path, so gain rides the smoothed
-envelope in dB. Detector always tracks the band signal (even when the
-band's processing is disabled) so meters and re-engagement stay honest.
+State ownership is deliberately narrow: the *only* mutable state here is
+the detection envelope (``env``).  The band gain is a pure function of
+(env, config) computed by :func:`static_gain_db`, so it never needs to be
+migrated or reconciled when a band is rerouted.  Detector coefficients
+are also derived from config and sample rate, cached by key.
+
+The envelope persists across audio blocks; the same detector coefficients
+are used for the gain path, so gain rides the smoothed envelope in dB.
+The detector always tracks the band signal (even when the band's
+processing is disabled) so meters and re-engagement stay honest.
 """
 
 import math
@@ -80,3 +86,14 @@ class BandDynamics:
 
     def track_only(self, x):
         self._track(x)
+
+    # ---- envelope memory: the only state this object owns ---------------
+    def envelope(self):
+        return self.env
+
+    def set_envelope(self, value):
+        self.env = float(value)
+
+    def reset_envelope(self):
+        """Drop the detector history (rebuild for a new detection source)."""
+        self.env = 0.0

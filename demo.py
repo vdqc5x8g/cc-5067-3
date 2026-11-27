@@ -176,7 +176,35 @@ def main():
         err = maxdiff(eng.process(post), ideal)
         print(f"   {policy:6s} 重组误差: {err:.3e}")
 
-    print("== 6. 同相/反相尾振两组,切换瞬间输入相等 ==")
+    print("== 6. 状态归属: 换带后包络按检测源继承或重建 ==")
+    # loud 500 Hz in band 0 (0-900); move the split down so 500 Hz leaves band 0
+    def _prime_punchy(eng):
+        for k in range(eng.num_bands):
+            eng.set_band(k, threshold_db=-24.0, ratio=8.0, knee_db=0.0,
+                         attack_ms=2.0, release_ms=400.0)
+        eng.process(tone(500.0, 0.8, 0.5))
+        return eng.envelope_state()
+    for policy in ("map", "swap"):
+        eng = MultibandEngine(FS, [900.0])
+        before = _prime_punchy(eng)
+        eng.move_crossovers([400.0], policy=policy,
+                            tone_hint=(500.0, 0.8, 0.0) if policy == "map" else None)
+        after = eng.envelope_state()
+        print(f"   {policy:4s} 换带前 band0 包络 {before[0]['envelope']:.3f} "
+              f"({before[0]['gain_db']:.1f} dB) -> 换带后 band0 包络 "
+              f"{after[0]['envelope']:.3f} ({after[0]['gain_db']:.1f} dB)")
+    # renumbering: 2000 Hz top band 1 -> 2 keeps its envelope
+    eng = MultibandEngine(FS, [900.0])
+    for k in range(eng.num_bands):
+        eng.set_band(k, threshold_db=-24.0, ratio=8.0, attack_ms=2.0, release_ms=400.0)
+    eng.process(tone(2000.0, 0.8, 0.5))
+    top_before = eng.envelope_state()[1]["envelope"]
+    eng.move_crossovers([400.0, 900.0], policy="map", tone_hint=(2000.0, 0.8, 0.0))
+    st = eng.envelope_state()
+    print(f"   顶层带 1->2 同源继承: 换带前 {top_before:.3f} -> 换带后 "
+          f"{st[2]['envelope']:.3f} (区间 {st[2]['range'][0]:.0f}-{st[2]['range'][1]:.0f} Hz)")
+
+    print("== 7. 同相/反相尾振两组,切换瞬间输入相等 ==")
     for name, sil in (("同相", 96), ("反相", 96 + int(FS / 800.0))):
         eng = MultibandEngine(FS, xover)
         eng.process(tone(250.0, 0.8, 0.03))
@@ -186,7 +214,7 @@ def main():
         err = maxdiff(eng.process(post), ideal)
         print(f"   {name}尾振 map 误差: {err:.3e}")
 
-    print("== 7. 同一次扫频:旁路录音 + 实时伴奏(分频扫动)==")
+    print("== 8. 同一次扫频:旁路录音 + 实时伴奏(分频扫动)==")
     x = chirp(30.0, 16000.0, 0.8, 1.0)
     rec = MultibandEngine(FS, xover)
     rec.set_bypass(True)

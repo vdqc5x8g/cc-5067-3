@@ -92,4 +92,4 @@ def test_disabled_band_still_passes_and_tracks():
     # band 0 content is present in the sum (not silently deleted)
     assert max(abs(v) for v in y) > 0.3
     # detector kept tracking the disabled band
-    assert eng._core.dyns[0].env > 0.3
+    assert eng.envelope_state()[0]["envelope"] > 0.3

@@ -5,6 +5,18 @@ across blocks. Declared unity response (all band gains = 1, processing
 on): the cascade of the stage allpasses, i.e. exactly flat magnitude with
 the allpass phase of the LR4 stages (see crossover.py).
 
+State is owned by three distinct layers (see bands.py):
+  filter memory    -> MultibandCrossover biquad states
+  envelope memory  -> one BandDynamics.env per band (keyed by detection
+                      source = the band's frequency interval)
+  band gain        -> pure function of (env, config); no memory
+
+A crossover move is a *filter-state recombination boundary*: the new
+topology's filters are established (retuned in place or warmed up), and
+each band's envelope is then inherited or rebuilt strictly by whether its
+detection source is unchanged.  An unreleased gain from an old band can
+therefore never follow a band index onto a different source.
+
 Switch semantics (each independently verifiable):
   bypass=True          output is bit-exact the input (cores keep running)
   processing_on=False  bands sum at unity gain through the crossover
@@ -13,14 +25,17 @@ Switch semantics (each independently verifiable):
   solo                 only soloed bands reach the output
   mute                 band excluded from the sum
 
-Crossover moves while running use one of three policies:
-  xfade     double-run old/new cores and crossfade; needs >= settle frames
-            of warmup input history
-  map       align every filter's memory to a known sustained tone
-            (needs tone_hint); instantaneous
-  deferred  keep the old band split while the new core warms up on the
-            live stream, then switch (the band switch is delayed)
-  swap      raw coefficient swap, states kept (baseline for comparison)
+Crossover moves while running use one of these policies:
+  xfade     double-run old/new topologies and crossfade; needs >= settle
+            frames of warmup history.  The new topology is warmed on that
+            live history, so every band's envelope is rebuilt from the new
+            source (never inherited from the old topology).
+  map       retune/map filter memory to a known sustained tone and migrate
+            envelopes by source; instantaneous.  Needs tone_hint.
+  deferred  keep the old split while the new topology warms up on the live
+            stream, then switch (the band switch is delayed).
+  swap      raw coefficient swap, states kept by index (baseline for
+            comparison: this is the stale-envelope bug made visible).
 'auto' picks xfade when enough warmup frames exist, else map when a tone
 hint is given, else deferred.
 """
@@ -29,58 +44,15 @@ import cmath
 import math
 from collections import deque
 
-from .crossover import AllpassCascade, MultibandCrossover
-from .dynamics import BandConfig, BandDynamics
+from .bands import BandProcessing, band_ranges, configs_for_topology
+from .crossover import AllpassCascade
+from .dynamics import BandConfig
 
-
-class _Delay:
-    __slots__ = ("n", "buf", "i")
-
-    def __init__(self, n):
-        self.n = n
-        self.buf = [0.0] * n if n > 0 else None
-        self.i = 0
-
-    def step(self, x):
-        if self.n == 0:
-            return x
-        y = self.buf[self.i]
-        self.buf[self.i] = x
-        self.i = (self.i + 1) % self.n
-        return y
-
-
-class _Core:
-    """One crossover + per-band dynamics + aligned band delays."""
-
-    def __init__(self, fs, freqs, band_cfgs, lookahead):
-        self.crossover = MultibandCrossover(freqs, fs)
-        self.dyns = [BandDynamics(fs, c) for c in band_cfgs]
-        self.delays = [_Delay(lookahead) for _ in band_cfgs]
-
-    def step(self, x, eng, probe):
-        bands = self.crossover.step(x)
-        out = 0.0
-        solo_any = eng.any_solo
-        for k, cfg in enumerate(eng.bands):
-            xd = self.delays[k].step(bands[k])
-            if eng.processing_on and cfg.enabled:
-                g = self.dyns[k].step_gain(bands[k])
-            else:
-                g = 1.0
-                if eng.processing_on:
-                    self.dyns[k].track_only(bands[k])
-            post = xd * g
-            if probe:
-                if eng.probe_bands:
-                    eng.band_trace[k].append(post)
-                if eng.probe_gains:
-                    eng.gain_trace[k].append(self.dyns[k].gain_db()
-                                             if cfg.enabled and eng.processing_on
-                                             else 0.0)
-            if (cfg.solo if solo_any else not cfg.mute):
-                out += post
-        return out
+# Compatibility adapter: the pre-refactor entry point constructed as
+# ``_Core(fs, freqs, band_cfgs, lookahead)``.  It now IS the band-processing
+# unit (same constructor, plus a ``step`` alias), so old callers that only
+# touched ``.crossover`` / ``.dyns`` keep working.
+_Core = BandProcessing
 
 
 class MultibandEngine:
@@ -100,8 +72,8 @@ class MultibandEngine:
                 f"[{self.MIN_FS}, {self.MAX_FS}] Hz")
         self.fs = float(sample_rate)
         self._validate(crossovers)
-        self.freqs = [float(f) for f in crossovers]
-        self.bands = [BandConfig() for _ in range(len(self.freqs) + 1)]
+        freqs = [float(f) for f in crossovers]
+        configs = [BandConfig() for _ in range(len(freqs) + 1)]
         self.lookahead = max(0, int(round(lookahead_ms * self.fs * 1e-3)))
         self.bypass = False
         self.processing_on = True
@@ -110,15 +82,14 @@ class MultibandEngine:
         self.warmup = deque(maxlen=int(warmup_frames))
         self.probe_bands = False
         self.probe_gains = False
-        self.band_trace = [[] for _ in self.bands]
-        self.gain_trace = [[] for _ in self.bands]
+        self.band_trace = [[] for _ in configs]
+        self.gain_trace = [[] for _ in configs]
         self.switch_log = []
         self.n = 0
-        self._core = _Core(self.fs, self.freqs, self.bands, self.lookahead)
-        self._xfade = None      # [old_core, new_core, pos, frames]
-        self._shadow = None     # [new_core, countdown]
+        self._proc = BandProcessing(self.fs, freqs, configs, self.lookahead)
+        self._xfade = None      # [old_proc, new_proc, pos, frames]
+        self._shadow = None     # [new_proc, countdown]
         self._pending_freqs = None
-        self._preroll = False
 
     # ---------------------------------------------------------- configuration
     def _validate(self, freqs):
@@ -143,8 +114,22 @@ class MultibandEngine:
                     f"crossover spacing {a}/{b} below {self.MIN_SPACING_OCT} octave")
 
     @property
+    def freqs(self):
+        return list(self._proc.freqs)
+
+    @property
+    def pending_freqs(self):
+        """Crossover set of an in-progress move, or None."""
+        return None if self._pending_freqs is None else list(self._pending_freqs)
+
+    @property
+    def bands(self):
+        """Canonical per-band configs (owned by the active topology)."""
+        return self._proc.configs
+
+    @property
     def num_bands(self):
-        return len(self.bands)
+        return self._proc.num_bands
 
     @property
     def any_solo(self):
@@ -154,12 +139,18 @@ class MultibandEngine:
     def latency_samples(self):
         return self.lookahead
 
+    @property
+    def _core(self):
+        """Compat: pre-refactor handle exposing ``.crossover`` / ``.dyns``."""
+        return self._proc
+
+    @property
+    def crossover(self):
+        """The active filter bank (read-only view for analysis/plotting)."""
+        return self._proc.crossover
+
     def set_band(self, k, **params):
-        cfg = self.bands[k]
-        for key, val in params.items():
-            if not hasattr(cfg, key):
-                raise ValueError(f"unknown band parameter {key!r}")
-            setattr(cfg, key, val)
+        self._proc.update_config(k, **params)
 
     def set_solo(self, k, on):
         self.bands[k].solo = bool(on)
@@ -175,7 +166,8 @@ class MultibandEngine:
 
     def reset_states(self, clear_log=True):
         self._finish_transition()  # never silently drop a pending band switch
-        self._core = _Core(self.fs, self.freqs, self.bands, self.lookahead)
+        self._proc = BandProcessing(self.fs, self._proc.freqs,
+                                    self._proc.configs, self.lookahead)
         self._xfade = None
         self._shadow = None
         self._pending_freqs = None
@@ -186,7 +178,7 @@ class MultibandEngine:
             self.switch_log.clear()
 
     def settle_frames(self, fmin=None):
-        f = fmin if fmin else min(self.freqs)
+        f = fmin if fmin else min(self._proc.freqs)
         return max(1, int(math.ceil(1.6 * self.fs / f)))
 
     # ------------------------------------------------------------- processing
@@ -202,50 +194,75 @@ class MultibandEngine:
             out.append(self._step(x))
         return out
 
+    def process_block(self, block):
+        """Unified block entry point (alias of :meth:`process`)."""
+        return self.process(block)
+
     def _step(self, x):
         self.n += 1
         if self._shadow is not None:
             sh = self._shadow
-            sh[0].step(x, self, False)
+            switch_now = sh[1] <= 1
+            # probe only on the sample that actually reaches the output, so
+            # the new core is stepped exactly once per sample (no double-step
+            # on the switch sample) and traces stay aligned with the output
+            y_new = sh[0].process_sample(x, self, probe=switch_now)
             sh[1] -= 1
-            if sh[1] <= 0:
-                self._core = sh[0]
+            if switch_now:
+                self._install(sh[0])
                 self._shadow = None
-                self.freqs = self._pending_freqs
-                self._pending_freqs = None
                 self.switch_log.append({"n": self.n, "policy": "deferred-applied",
-                                        "freqs": list(self.freqs)})
-        if self._xfade is not None:
+                                        "freqs": list(self._proc.freqs)})
+                y = y_new
+            else:
+                y = self._proc.process_sample(x, self, probe=True)
+        elif self._xfade is not None:
             xf = self._xfade
-            o = xf[0].step(x, self, False)
-            n = xf[1].step(x, self, True)
+            o = xf[0].process_sample(x, self, probe=False)
+            n = xf[1].process_sample(x, self, probe=True)
             w = 0.5 * (1.0 - math.cos(math.pi * (xf[2] + 1) / xf[3]))
             y = (1.0 - w) * o + w * n
             xf[2] += 1
             if xf[2] >= xf[3]:
-                self._core = xf[1]
+                self._install(xf[1])
                 self._xfade = None
-                self.freqs = self._pending_freqs
-                self._pending_freqs = None
                 self.switch_log.append({"n": self.n, "policy": "xfade-done",
-                                        "freqs": list(self.freqs)})
+                                        "freqs": list(self._proc.freqs)})
         else:
-            y = self._core.step(x, self, not self._preroll)
+            y = self._proc.process_sample(x, self, probe=True)
         if self.bypass:
             return x
         return y
 
+    def _install(self, proc):
+        self._proc = proc
+        self._pending_freqs = None
+        if len(self.band_trace) != proc.num_bands:
+            self.band_trace = [[] for _ in range(proc.num_bands)]
+            self.gain_trace = [[] for _ in range(proc.num_bands)]
+
     # -------------------------------------------------------- crossover moves
     def _finish_transition(self):
         if self._xfade is not None:
-            self._core = self._xfade[1]
+            self._install(self._xfade[1])
             self._xfade = None
-        if self._shadow is not None:
-            self._core = self._shadow[0]
+        elif self._shadow is not None:
+            self._install(self._shadow[0])
             self._shadow = None
-        if self._pending_freqs is not None:
-            self.freqs = self._pending_freqs
+        elif self._pending_freqs is not None:
             self._pending_freqs = None
+
+    def _new_processing(self, new_freqs):
+        """Build a fresh topology for a double-run (xfade/deferred) move.
+
+        Envelopes are intentionally NOT inherited here: a double-run policy
+        warms the new topology on the live stream, so every band's detector
+        is rebuilt from the *new* source.  A fresh core can never hold an
+        old source's envelope, so this is rebuild-from-new, never leakage.
+        """
+        cfgs = configs_for_topology(self._proc.configs, self._proc.freqs,
+                                    new_freqs, self.fs)
+        return BandProcessing(self.fs, new_freqs, cfgs, self.lookahead)
 
     def move_crossovers(self, new_freqs, policy="auto", tone_hint=None):
         """Move all crossover points. Returns the policy actually used.
@@ -257,7 +274,8 @@ class MultibandEngine:
         self._validate(new_freqs)
         new_freqs = [float(f) for f in new_freqs]
         self._finish_transition()
-        fmin = min(min(new_freqs), min(self.freqs))
+        old_freqs = list(self._proc.freqs)
+        fmin = min(min(new_freqs), min(old_freqs))
         settle = self.settle_frames(fmin)
         if policy == "auto":
             if len(self.warmup) >= settle:
@@ -272,31 +290,43 @@ class MultibandEngine:
             f, ampl, phase = tone_hint
             w = math.tau * f / self.fs
             X = ampl * cmath.exp(1j * phase)
-            self._core.crossover.set_frequencies(new_freqs)
-            self._core.crossover.map_state(w, X)
-            self.freqs = new_freqs
+            old_envs = self._proc.envelope_snapshot()
+            if len(new_freqs) == len(old_freqs):
+                # same topology count: preserve filter/delay memory, then map
+                self._proc.retune_in_place(new_freqs)
+                self._proc.map_filter_state(w, X)
+                self._proc.recombine_envelopes(old_freqs, old_envs)
+            else:
+                # count change: filters/delays necessarily rebuilt, but map
+                # them to the tone and migrate envelopes by source
+                new_proc = BandProcessing(
+                    self.fs, new_freqs,
+                    configs_for_topology(self._proc.configs, old_freqs,
+                                         new_freqs, self.fs),
+                    self.lookahead)
+                new_proc.map_filter_state(w, X)
+                new_proc.recombine_envelopes(old_freqs, old_envs)
+                self._install(new_proc)
             self.switch_log.append({"n": self.n, "policy": "map",
                                     "freqs": list(new_freqs)})
         elif policy == "xfade":
-            new_core = _Core(self.fs, new_freqs, self.bands, self.lookahead)
-            self._preroll = True
+            new_proc = self._new_processing(new_freqs)
             for s in self.warmup:
-                new_core.step(s, self, False)
-            self._preroll = False
+                new_proc.process_sample(s, self, probe=False)
             frames = max(1, min(settle, len(self.warmup)))
-            self._xfade = [self._core, new_core, 0, frames]
+            self._xfade = [self._proc, new_proc, 0, frames]
             self._pending_freqs = new_freqs
             self.switch_log.append({"n": self.n, "policy": "xfade",
                                     "frames": frames, "freqs": list(new_freqs)})
         elif policy == "deferred":
-            new_core = _Core(self.fs, new_freqs, self.bands, self.lookahead)
-            self._shadow = [new_core, settle]
+            new_proc = self._new_processing(new_freqs)
+            self._shadow = [new_proc, settle]
             self._pending_freqs = new_freqs
             self.switch_log.append({"n": self.n, "policy": "deferred",
                                     "frames": settle, "freqs": list(new_freqs)})
         elif policy == "swap":
-            self._core.crossover.set_frequencies(new_freqs)
-            self.freqs = new_freqs
+            # raw baseline: filter coefficients retuned, memories untouched
+            self._proc.retune_in_place(new_freqs)
             self.switch_log.append({"n": self.n, "policy": "swap",
                                     "freqs": list(new_freqs)})
         else:
@@ -306,8 +336,23 @@ class MultibandEngine:
     # ---------------------------------------------------------------- analysis
     def reference_allpass(self):
         """The declared unity-gain response as a standalone filter."""
-        return AllpassCascade(self.freqs, self.fs)
+        return AllpassCascade(self._proc.freqs, self.fs)
 
     def band_ranges(self):
-        edges = [0.0] + self.freqs + [self.fs * 0.5]
-        return [(edges[i], edges[i + 1]) for i in range(len(edges) - 1)]
+        return band_ranges(self._proc.freqs, self.fs)
+
+    def envelope_state(self):
+        """Per-band running state: source interval, envelope, derived gain."""
+        p = self._proc
+        out = []
+        for k, (lo, hi) in enumerate(band_ranges(p.freqs, self.fs)):
+            cfg = p.configs[k]
+            active = cfg.enabled and self.processing_on
+            out.append({
+                "index": k,
+                "range": (lo, hi),
+                "envelope": p.dyns[k].envelope(),
+                "gain_db": p.dyns[k].gain_db() if active else 0.0,
+                "enabled": cfg.enabled,
+            })
+        return out

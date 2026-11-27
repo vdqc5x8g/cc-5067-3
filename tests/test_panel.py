@@ -48,6 +48,7 @@ def test_model_audition_results_and_wav():
     m = _model()
     res = m.audition("synthetic")
     assert res["recomb_error"] < 1e-9, res["recomb_error"]
+    assert res["anomaly"] is None, res["anomaly"]
     assert res["samples"] == len(m.last_input) == len(m.last_output)
     assert min(res["max_gr_db"]) < -1.0, "audition never compressed"
     assert len(res["max_gr_db"]) == m.engine.num_bands
@@ -59,6 +60,26 @@ def test_model_audition_results_and_wav():
     assert st["bands"][0]["solo"] and st["limits"]["min_hz"] == 40.0
     assert len(st["band_db"]) == 3 and len(st["sum_db"]) == len(st["grid"])
     assert max(abs(v) for v in st["sum_db"]) < 1e-6, "sum curve not flat"
+    assert st["response_anomaly"] is None
+
+
+def test_state_exposes_band_dynamics_and_survives_move():
+    m = _model()
+    m.audition("synthetic")
+    st = m.state_dict()
+    dyn = st["dynamics"]
+    assert len(dyn) == m.engine.num_bands
+    for d in dyn:
+        assert set(d) >= {"index", "range", "envelope", "gain_db", "enabled"}
+        assert d["range"][0] < d["range"][1]
+    # a crossover move renumbers bands; the state view must stay consistent
+    m.set_crossover(0, 420.0)
+    st = m.state_dict()
+    assert len(st["dynamics"]) == m.engine.num_bands
+    assert all(d["range"][1] - d["range"][0] > 0 for d in st["dynamics"])
+    assert st["response_anomaly"] is None
+    # the sum curve is still the flat declared response after the move
+    assert max(abs(v) for v in st["sum_db"]) < 1e-6
 
 
 def _post(url, payload):
